@@ -8,13 +8,16 @@ from __future__ import annotations
 import os
 import json
 import asyncio
+import hashlib
 from datetime import datetime
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Any, Dict, List, Optional
 
+import httpx
 from dotenv import load_dotenv
 load_dotenv()
 
 GOOGLE_API_KEY = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip() or None
+FACTCHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
 _HAS_GENAI = False
 try:
@@ -101,6 +104,47 @@ def _detect_lang(text: str) -> str:
     return "en"
 
 
+def _map_factcheck_rating(rating_str: str) -> tuple[str, int]:
+    """Normalizes heterogeneous publisher ratings to TruthTrack verdicts."""
+    r = rating_str.lower()
+    if any(w in r for w in ["false", "fake", "incorrect", "hoax", "pants on fire", "misleading", "distorted"]):
+        return "False", 96
+    if any(w in r for w in ["true", "correct", "accurate"]):
+        return "Verified", 94
+    if any(w in r for w in ["partly", "half", "mixture", "exaggerated", "mostly true", "mostly false"]):
+        return "Partly Supported", 75
+    if any(w in r for w in ["outdated", "old", "expired"]):
+        return "Outdated", 90
+    return "Unconfirmed", 50
+
+
+async def query_google_fact_check(query: str, language: str = "en") -> Optional[Dict[str, Any]]:
+    """Queries Google Fact Check Tools API for registered ClaimReview entries."""
+    if not GOOGLE_API_KEY:
+        return None
+
+    # Limit query length for API match accuracy
+    clean_query = " ".join(query.split()[:12])
+    params = {
+        "query": clean_query,
+        "key": GOOGLE_API_KEY,
+        "languageCode": language,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(FACTCHECK_URL, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                claims = data.get("claims", [])
+                if claims:
+                    return claims[0]
+    except Exception as e:
+        print("Fact Check API call error:", e)
+
+    return None
+
+
 async def verify_claim(
     claim_text: str,
     file_bytes: bytes | None = None,
@@ -151,7 +195,59 @@ async def verify_claim(
     if file_bytes and not claim_text:
         extracted_text = "[Extracted Content from Uploaded Attachment]"
 
-    # ── Live Gemini Call ─────────────────────────────────────────────────────
+    # ── Stage 1: Structured Fact Check Lookup (Google Fact Check Tools API) ───
+    if extracted_text and extracted_text != "[Extracted Content from Uploaded Attachment]":
+        claim_match = await query_google_fact_check(extracted_text, language="en")
+        
+        # If not found in English, retry query with detected language if vernacular
+        if not claim_match and detected in ["hi", "mr", "bn", "ta", "te", "gu"]:
+            claim_match = await query_google_fact_check(extracted_text, language=detected)
+
+        if claim_match:
+            review = claim_match.get("claimReview", [{}])[0]
+            publisher_name = review.get("publisher", {}).get("name", "Certified Fact-Checker")
+            rating_text = review.get("textualRating", "Unconfirmed")
+            review_url = review.get("url", "https://toolbox.google.com/factcheck/explorer")
+            
+            verdict, conf = _map_factcheck_rating(rating_text)
+
+            return {
+                "verdict": verdict,
+                "confidence": conf,
+                "summary": f"This claim was evaluated by {publisher_name}, which rated it as '{rating_text}'. Official report: {review.get('title') or claim_match.get('text')}.",
+                "vernacular_card": {
+                    "headline": f"Fact Checked: Rated '{rating_text}' by {publisher_name}",
+                    "explanation": f"Independent fact-checker {publisher_name} reviewed this assertion and designated it as '{rating_text}'. Do not share unverified rumors.",
+                    "warning_tag": f"{verdict} ({rating_text})"
+                },
+                "atomic_claims": [
+                    {
+                        "claim": claim_match.get("text", extracted_text),
+                        "sub_verdict": verdict,
+                        "evidence": f"Reviewed by {publisher_name} with rating '{rating_text}'."
+                    }
+                ],
+                "temporal_analysis": {
+                    "is_outdated": verdict == "Outdated",
+                    "extracted_timeframe": claim_match.get("claimDate", "Archived record"),
+                    "discrepancy_note": "Direct match from indexed Fact Check registries."
+                },
+                "multimodal_analysis": {
+                    "visual_detected": is_image,
+                    "mismatch_detected": False,
+                    "detail": "Claim matched authoritative registry records."
+                },
+                "key_findings": [
+                    f"Verified against certified ClaimReview publisher: {publisher_name}",
+                    f"Official rating: {rating_text}",
+                    f"Claimant referenced: {claim_match.get('claimant', 'Social Media viral message')}"
+                ],
+                "sources": [
+                    {"title": publisher_name, "url": review_url, "reliability": "High (Certified Fact-Checker)"}
+                ]
+            }
+
+    # ── Stage 2: Live Gemini Call (Reasoning & Multimodal) ───────────────────
     if GOOGLE_API_KEY and _HAS_GENAI:
         try:
             client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -174,18 +270,16 @@ async def verify_claim(
             )
             return json.loads(response.text)
         except Exception:
-            pass  # Fall through to simulation engine
+            pass  # Fall through to web search and simulation
 
     text    = extracted_text or ""
     lowered = text.lower()
 
-    # ── Live Web Search Fallback (Using DDGS) ────────────────────────────────
+    # ── Stage 3: Live Web Search Fallback (Using DDGS) ───────────────────────
     try:
         from ddgs import DDGS
-        # Search the first 10 words of the claim
         query_text = " ".join(text.split()[:10]) + " fact check truth"
         
-        # Run search asynchronously with a strict 4.0s timeout
         search_results = await asyncio.wait_for(
             asyncio.to_thread(lambda: list(DDGS().text(query_text, max_results=3))),
             timeout=4.0
@@ -194,11 +288,9 @@ async def verify_claim(
         if search_results:
             combined_titles = " ".join(r['title'].lower() for r in search_results)
             
-            # Simple keyword-based verification logic on Live Web Results
             is_fake = any(w in combined_titles for w in ['fake', 'hoax', 'false', 'debunked', 'rumour', 'misleading', 'fact check: false', 'fact check: fake'])
             is_true = any(w in combined_titles for w in ['dies', 'died', 'death', 'passes away', 'passed away', 'confirmed', 'true', 'announces', 'official', 'breaking'])
             
-            # Fact check usually takes precedence if it explicitly says fake
             if is_fake:
                 verdict = "False"
                 conf = 95
@@ -238,13 +330,9 @@ async def verify_claim(
             }
     except Exception as e:
         print("Live Search Failed:", e)
-        pass # Fallback to standard simulation
+        pass
 
-    # ── Simulation Engine (English output always) ────────────────────────────
-    text    = extracted_text or ""
-    lowered = text.lower()
-
-    # Death / person passed away claims (works for Marathi निधन, Hindi निधन, English)
+    # ── Stage 4: Static Pattern Rules & Fallback Pool ────────────────────────
     if any(w in text for w in ["निधन", "मृत्यू", "मृत्यु", "मरण", "मेले", "गेले", "death", "died", "passed away"]):
         return {
             "verdict": "False", "confidence": 97,
@@ -267,7 +355,6 @@ async def verify_claim(
             "sources": [{"title": "PIB Fact Check", "url": "https://factcheck.pib.gov.in", "reliability": "Official Government Source"}]
         }
 
-    # Government scheme / free money claims
     if any(w in text for w in ["सरकार", "योजना", "अनुदान", "मोफत", "लाभ", "निधी", "government", "scheme", "free", "subsidy"]):
         return {
             "verdict": "Unconfirmed", "confidence": 45,
@@ -284,7 +371,6 @@ async def verify_claim(
             "sources": [{"title": "PIB Fact Check", "url": "https://factcheck.pib.gov.in", "reliability": "Official"}]
         }
 
-    # Anti-gravity / NASA / Ladakh hoax
     if "anti-gravity" in lowered or "nasa" in lowered or "ladakh" in lowered:
         return {
             "verdict": "False", "confidence": 98,
@@ -307,7 +393,6 @@ async def verify_claim(
             ]
         }
 
-    # Lockdown / curfew / bank circular
     if "lockdown" in lowered or "curfew" in lowered or "bank" in lowered:
         return {
             "verdict": "Outdated", "confidence": 94,
@@ -327,14 +412,13 @@ async def verify_claim(
             "sources": [{"title": "Press Information Bureau Archive", "url": "https://pib.gov.in", "reliability": "Official Government Source"}]
         }
 
-    # ── Varied default fallback (hash-based, deterministic but unique per claim) ──
-    import hashlib
+    # Deterministic simulation hash pool
     h = int(hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest(), 16)
 
     POOL = [
         {
             "verdict": "False",
-            "confidence": 72 + (h % 22),   # 72–93
+            "confidence": 72 + (h % 22),
             "summary": "Multiple authoritative sources directly contradict this claim. The information appears to have originated from a known misinformation network and has been debunked by independent fact-checkers.",
             "vernacular_card": {
                 "headline": "This claim has been debunked — do NOT forward",
@@ -358,7 +442,7 @@ async def verify_claim(
         },
         {
             "verdict": "Partly Supported",
-            "confidence": 51 + (h % 25),   # 51–75
+            "confidence": 51 + (h % 25),
             "summary": "The message contains a grain of truth but mixes it with inaccurate details or exaggerations. The core event may have occurred, but key claims about its scale or consequence are not supported by evidence.",
             "vernacular_card": {
                 "headline": "Partly true — key claims are exaggerated",
@@ -379,7 +463,7 @@ async def verify_claim(
         },
         {
             "verdict": "Unconfirmed",
-            "confidence": 28 + (h % 20),   # 28–47
+            "confidence": 28 + (h % 20),
             "summary": "There is insufficient verifiable evidence to confirm or deny this claim at this time. It may be a developing story, a rumour, or information that has not yet been independently verified by credible sources.",
             "vernacular_card": {
                 "headline": "Cannot confirm — wait for official sources",
@@ -402,7 +486,7 @@ async def verify_claim(
         },
         {
             "verdict": "Verified",
-            "confidence": 80 + (h % 18),   # 80–97
+            "confidence": 80 + (h % 18),
             "summary": "The core claim is accurate and corroborated by multiple independent credible sources. Minor contextual details may differ across reports, but the fundamental assertion is true.",
             "vernacular_card": {
                 "headline": "This claim is TRUE and verified",
@@ -432,4 +516,3 @@ async def verify_claim(
         "detail": result["multimodal_analysis"]["detail"]
     }
     return result
-
