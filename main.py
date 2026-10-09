@@ -6,6 +6,7 @@ Serves the frontend, handles WebSocket fact-checking, and exposes analytics.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -14,16 +15,23 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from services.verifier  import verify_claim, GOOGLE_API_KEY, _HAS_GENAI, SUPPORTED_LANGUAGES
-from services.database  import init_db, save_check, get_stats, get_recent_checks
+from services.verifier import verify_claim, GOOGLE_API_KEY, _HAS_GENAI, SUPPORTED_LANGUAGES
+from services.database import init_db, save_check, get_stats, get_recent_checks
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# ── App setup & Lifecycle ─────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize SQLite database schema
+    await init_db()
+    yield
 
 app = FastAPI(
     title="TruthTrack",
     description="AI-powered multimodal fact-checking API",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 static_dir = BASE_DIR / "static"
@@ -36,22 +44,28 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def on_startup():
-    await init_db()
-
-
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 def _current_mode() -> dict:
-    ai_ready = bool(GOOGLE_API_KEY) and _HAS_GENAI
+    has_key = bool(GOOGLE_API_KEY)
+    ai_ready = has_key and _HAS_GENAI
+    
+    if ai_ready:
+        label = "🤖 Hybrid Mode (Google Fact Check + Gemini 2.5 Flash)"
+        mode = "hybrid"
+    elif has_key:
+        label = "🔍 Registry Mode (Google Fact Check Tools API Only)"
+        mode = "factcheck_only"
+    else:
+        label = "🎭 Simulation & Web Scraping Mode"
+        mode = "simulation"
+
     return {
-        "mode":            "ai" if ai_ready else "simulation",
-        "label":           "🤖 AI Mode (Gemini)" if ai_ready else "🎭 Simulation Mode",
-        "api_key_set":     bool(GOOGLE_API_KEY),
+        "mode": mode,
+        "label": label,
+        "api_key_set": has_key,
         "genai_installed": _HAS_GENAI,
+        "fact_check_api_ready": has_key,
     }
 
 
@@ -103,38 +117,38 @@ async def api_recent(limit: int = 20):
 @app.websocket("/ws/verify")
 async def ws_verify(websocket: WebSocket):
     """
-    Client → Server (JSON):
-      { "claim_text": str, "file_data": b64|null, "file_mime": str|null, "file_name": str|null }
+    Client -> Server (JSON):
+      { "claim_text": str, "file_data": b64|null, "file_mime": str|null, "file_name": str|null, "lang_code": str }
 
-    Server → Client (multiple frames):
+    Server -> Client (multiple frames):
       { "type": "status",  "message": str, "step": int, "total_steps": int }
       { "type": "result",  ...verdict fields... }
       { "type": "error",   "message": str }
     """
     await websocket.accept()
     try:
-        raw     = await websocket.receive_text()
+        raw = await websocket.receive_text()
         payload = json.loads(raw)
 
-        claim_text: str       = payload.get("claim_text", "").strip()
-        file_b64:   str|None  = payload.get("file_data")
-        file_mime:  str|None  = payload.get("file_mime")
-        file_name:  str|None  = payload.get("file_name")
-        lang_code:  str       = payload.get("lang_code", "auto")
+        claim_text: str        = payload.get("claim_text", "").strip()
+        file_b64:   str | None = payload.get("file_data")
+        file_mime:  str | None = payload.get("file_mime")
+        file_name:  str | None = payload.get("file_name")
+        lang_code:  str        = payload.get("lang_code", "auto")
 
-        file_bytes: bytes|None = None
+        file_bytes: bytes | None = None
         if file_b64:
             import base64
             file_bytes = base64.b64decode(file_b64)
 
         if not claim_text and not file_bytes:
-            await websocket.send_json({"type": "error",
-                                       "message": "Please provide text or attach a file."})
+            await websocket.send_json({"type": "error", "message": "Please provide text or attach a file."})
             return
 
         async def send_update(data: dict):
             await websocket.send_json(data)
 
+        # Triggers Stage 1 (Fact Check API) -> Stage 2 (Gemini) -> Stage 3 (DDGS) -> Stage 4 (Simulation)
         result = await verify_claim(
             claim_text=claim_text,
             file_bytes=file_bytes,
